@@ -1,113 +1,133 @@
-// MarketMemory — Railway Keeper v2
-// Apre la pagina Netlify in un browser headless e la mantiene viva H24.
-// Non modifica app.js. Non interferisce con la logica del motore.
+// MarketMemory — Railway Keeper v7
+const puppeteer = require('puppeteer-core');
+const { execSync } = require('child_process');
 
-const puppeteer = require('puppeteer');
-
-const APP_URL      = process.env.MM_URL            || 'https://YOUR-APP.netlify.app';
+const APP_URL      = process.env.MM_URL      || 'https://backtest-bomber.netlify.app';
+const API_KEY      = process.env.MM_APIKEY   || '';
 const RELOAD_EVERY = parseInt(process.env.RELOAD_EVERY_MIN || '120') * 60 * 1000;
 const CHECK_EVERY  = parseInt(process.env.CHECK_EVERY_MIN  || '5')   * 60 * 1000;
 const TZ           = process.env.TZ || 'Europe/Rome';
 
-function ts() {
-  return new Date().toLocaleString('it-IT', { timeZone: TZ });
+function ts()  { return new Date().toLocaleString('it-IT', { timeZone: TZ }); }
+function log(m){ console.log(`[${ts()}] ${m}`); }
+
+function findChromium() {
+  const candidates = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { execSync(`test -x "${p}"`, {stdio:'ignore'}); return p; } catch(_) {}
+  }
+  for (const cmd of ['chromium','chromium-browser','google-chrome']) {
+    try { return execSync(`which ${cmd}`, {encoding:'utf8'}).trim(); } catch(_) {}
+  }
+  throw new Error('Chromium non trovato');
 }
-function log(msg) { console.log(`[${ts()}] ${msg}`); }
 
 async function launch() {
-  log('Avvio Puppeteer...');
+  const chromePath = findChromium();
+  log(`Avvio Chromium: ${chromePath}`);
   const browser = await puppeteer.launch({
+    executablePath: chromePath,
     headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-    ]
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+           '--disable-gpu','--single-process','--no-zygote']
   });
-
   const page = await browser.newPage();
-
-  page.on('console', msg => {
-    if (msg.type() === 'error') log(`[browser:error] ${msg.text()}`);
-  });
-  page.on('pageerror', err => log(`[browser:pageerror] ${err.message}`));
+  page.on('console', msg => { if(msg.type()==='error') log(`[E] ${msg.text()}`); });
+  page.on('pageerror', err => log(`[pageerror] ${err.message}`));
 
   log(`Apertura ${APP_URL}`);
   await page.goto(APP_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-  log('Pagina caricata. Motore attivo.');
 
+  if (API_KEY) {
+    await page.evaluate((k) => {
+      localStorage.setItem('TWELVE_API_KEY', k);
+      var inp = document.getElementById('apiKey');
+      if (inp) { inp.value = k; inp.dispatchEvent(new Event('input')); }
+    }, API_KEY);
+    log('API key iniettata.');
+  } else {
+    log('WARN: MM_APIKEY non impostata.');
+  }
+
+  log('Reload...');
+  await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
+  await new Promise(r => setTimeout(r, 2000));
+
+  const started = await page.evaluate(() => {
+    var btn = Array.from(document.querySelectorAll('button'))
+      .find(b => b.innerText.includes('Avvia') || b.innerText.includes('Start'));
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  log(started ? 'Motore avviato.' : 'WARN: bottone Avvia non trovato.');
+
+  await new Promise(r => setTimeout(r, 8000));
+  log('Keeper pronto.');
   return { browser, page };
 }
 
-// Health check dinamico: verifica che il motore stia davvero girando
 async function checkAlive(page) {
-  return await page.evaluate(() => {
+  return page.evaluate(() => {
     try {
-      const s = window.state;
+      var s = window.state;
       if (!s) return { ok: false, reason: 'state undefined' };
-      const lastCycle = s.lastCycleAt || s.meta?.lastCycleAt || null;
-      const openTrades = (s.paper?.open || []).length;
-      const closedTrades = (s.paper?.closed || []).length;
       return {
         ok: true,
-        lastCycle,
-        openTrades,
-        closedTrades,
-        regime: s.lastAnalysis?.regimeResult?.regime || null
+        open:   s.paper && s.paper.open   ? s.paper.open.length   : 0,
+        closed: s.paper && s.paper.closed ? s.paper.closed.length : 0,
+        regime: s.lastAnalysis && s.lastAnalysis.regimeResult
+                ? s.lastAnalysis.regimeResult.regime : '?',
+        key:    s.apiKey ? 'OK' : 'MISSING'
       };
-    } catch(e) {
-      return { ok: false, reason: e.message };
-    }
+    } catch(e) { return { ok: false, reason: e.message }; }
   });
 }
 
 async function run() {
-  let browser, page;
-  let lastReload = Date.now();
+  var browser, page, lastReload = Date.now();
+  try { ({ browser, page } = await launch()); }
+  catch(e) { log(`Avvio fallito: ${e.message}`); process.exit(1); }
 
-  try {
-    ({ browser, page } = await launch());
-  } catch (err) {
-    log(`Errore avvio: ${err.message}`);
-    process.exit(1);
-  }
+  log(`Keeper attivo. Check ogni ${CHECK_EVERY/60000}min.`);
 
   setInterval(async () => {
     try {
-      // 1. Health check dinamico su window.state
-      const alive = await checkAlive(page);
-      if (alive.ok) {
-        log(`Health OK — regime:${alive.regime} open:${alive.openTrades} closed:${alive.closedTrades} lastCycle:${alive.lastCycle || 'n/a'}`);
+      var a = await checkAlive(page);
+      if (a.ok) {
+        log(`OK regime:${a.regime} open:${a.open} closed:${a.closed} key:${a.key}`);
       } else {
-        log(`Health WARN — ${alive.reason}`);
+        log(`WARN: ${a.reason}`);
+        await page.evaluate(() => {
+          var b = Array.from(document.querySelectorAll('button'))
+            .find(b => b.innerText.includes('Avvia') || b.innerText.includes('Start'));
+          if (b) b.click();
+        });
       }
-
-      // 2. Reload periodico per evitare memory leak e stato zombie
       if (Date.now() - lastReload > RELOAD_EVERY) {
         log('Reload periodico...');
         await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
+        await new Promise(r => setTimeout(r, 3000));
+        await page.evaluate(() => {
+          var b = Array.from(document.querySelectorAll('button'))
+            .find(b => b.innerText.includes('Avvia') || b.innerText.includes('Start'));
+          if (b) b.click();
+        });
         lastReload = Date.now();
-        log('Reload completato.');
+        log('Reload OK.');
       }
-
-    } catch (err) {
-      log(`Health check fallito: ${err.message} — riavvio browser...`);
+    } catch(e) {
+      log(`Check fallito: ${e.message} — riavvio...`);
       try { await browser.close(); } catch(_) {}
-      try {
-        ({ browser, page } = await launch());
-        lastReload = Date.now();
-      } catch (relaunchErr) {
-        log(`Riavvio fallito: ${relaunchErr.message} — uscita.`);
-        process.exit(1);
-      }
+      try { ({ browser, page } = await launch()); lastReload = Date.now(); }
+      catch(e2) { log(`Riavvio fallito: ${e2.message}`); process.exit(1); }
     }
   }, CHECK_EVERY);
-
-  log(`Keeper attivo. Check ogni ${CHECK_EVERY/60000}min, reload ogni ${RELOAD_EVERY/60000}min.`);
 }
 
 run();
